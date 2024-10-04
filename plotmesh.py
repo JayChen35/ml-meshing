@@ -35,14 +35,16 @@ def plot_metric_fields(mesh: dict, ax: plt.Axes):
         major_ax_i = np.argmax(eig_vals)
         minor_ax_i = int(not major_ax_i)
         axes_scales = np.zeros(len(eig_vals))
-        axes_scales[major_ax_i] = max([np.linalg.norm(x) for x in delta_x])
-        axes_scales[minor_ax_i] = axes_scales[major_ax_i] * (eig_vals[minor_ax_i]/eig_vals[major_ax_i])
-        angle_major = np.arctan2(eig_vecs[major_ax_i][0], eig_vecs[major_ax_i][1])
+        axes_scales[major_ax_i] = eig_vals[major_ax_i]**(-1/2)
+        axes_scales[minor_ax_i] = eig_vals[minor_ax_i]**(-1/2)
+        # axes_scales[major_ax_i] = max([np.linalg.norm(x) for x in delta_x])
+        # axes_scales[minor_ax_i] = axes_scales[major_ax_i] * (eig_vals[minor_ax_i]/eig_vals[major_ax_i])
+        angle_major = np.arctan2(eig_vecs[major_ax_i][1], eig_vecs[major_ax_i][0])
         # Only plot every 10th ellipse as to not overcrowd the plot
         if i % 10 == 0:
             plt.scatter(centroid[0], centroid[1], color='red', alpha=0.5, s=2)
             ellipse = Ellipse(centroid, axes_scales[major_ax_i], axes_scales[minor_ax_i],
-                              angle=angle_major*180/np.pi, facecolor='blue', alpha=0.5)
+                              angle=-angle_major*180/np.pi, facecolor='blue', alpha=0.5)
             ax.add_patch(ellipse)
 
 
