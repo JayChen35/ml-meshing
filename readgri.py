@@ -51,7 +51,17 @@ def readgri(fname):
     Ne0 = 0; E = []
     while (Ne0 < Ne):
         s = f.readline().split(); ne = int(s[0])
-        Ei = np.array([[int(s)-1 for s in f.readline().split()] for n in range(ne)])
+        # Here, we can have complex tetrahedrons (10 points):
+        Ei = []
+        for n in range(ne):
+            curr_line = f.readline().split()
+            if len(curr_line) == 10:
+                row = [int(curr_line[0])-1, int(curr_line[3])-1, int(curr_line[9])-1]
+            else:
+                row = [int(s)-1 for s in curr_line]
+            Ei.append(row)
+        Ei = np.array(Ei)
+        # Ei = np.array([[int(s)-1 for s in f.readline().split()] for n in range(ne)])
         E = Ei if (Ne0==0) else np.concatenate((E,Ei), axis=0)
         Ne0 += ne
     f.close()
