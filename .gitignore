@@ -289,6 +289,7 @@ $RECYCLE.BIN/
 
 private.pem
 .vscode
+__pycache__
 __pycache__/*
 
 # Locally created log files
