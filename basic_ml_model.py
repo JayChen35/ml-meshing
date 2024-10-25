@@ -5,13 +5,14 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+from scipy.linalg import logm
 import pandas as pd
 import os, re
 from readgri import readgri
 
 # Hyperparameters
 LEARNING_RATE = 1e-3
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 EPOCHS = 5
 
 
@@ -31,7 +32,7 @@ class GigaMesher9000(nn.Module):
         self.output_net = nn.Sequential(
             nn.Linear(10, 100),
             nn.ReLU(),
-            nn.Linear(100, 3)
+            nn.Linear(100, 4)
         )
 
 
@@ -79,8 +80,11 @@ class MeshDataset(Dataset):
                 A_mat = [[vec[0]**2, 2*vec[0]*vec[1], vec[1]**2] for vec in delta_x]
                 A_mat = np.reshape(np.asarray(A_mat), (3,3))
                 metric_abc = np.matmul(np.linalg.inv(A_mat), np.ones((3,1))).flatten()
+                # Take the matrix logarithm to reduce the wide range of possible values
+                metric_field = [[metric_abc[0], metric_abc[1]], [metric_abc[1], metric_abc[2]]]
+                label = matrix_log(torch.tensor(metric_field)).flatten().numpy()
                 # Define a single sample of our (feature, label) pair
-                data.append((np.asarray(feature), metric_abc))
+                data.append((np.asarray(feature), label))
         return pd.DataFrame(data, columns=['feature', 'label'])
 
     def __len__(self):
@@ -102,6 +106,43 @@ class ToTensor:
         tensor_feature = torch.tensor(feature, dtype=torch.float32)
         tensor_label = torch.tensor(label, dtype=torch.float32)
         return tensor_feature, tensor_label
+
+
+def matrix_loss(prediction: torch.Tensor, actual: torch.Tensor):
+    """
+    Compute the loss between the predicted metric field and actual metric field.
+    We are measuring loss via a symmetric step matrix, S. To do this, we need to
+    compute matrix logarithms and powers. Since metric fields are positive definite
+    symmetric matrices, we are guaranteed that they are invertible and that we have
+    n linearly independent eigenvectors, whose eigenvalues are all real and positive. 
+    """
+    # Not sure if there's a faster way to train a batch besides a for-loop
+    total_loss = 0
+    for row in range(len(prediction)):
+        M_0 = torch.unflatten(prediction[row], 0, (2,2))
+        M = torch.unflatten(actual[row], 0, (2,2))
+        M_0_temp = torch.linalg.inv(matrix_to_power(M_0, 1/2))
+        S = matrix_log(M_0_temp @ M @ M_0_temp)
+        total_loss += torch.diagonal(S)
+    return total_loss / len(prediction)
+
+
+def matrix_to_power(A: torch.Tensor, n: float) -> torch.Tensor:
+    """No built-in function for finding a matrix to the nth power."""
+    e_vals, e_vecs = torch.linalg.eig(A)
+    # Extract only real parts of eigenvalues
+    e_vals = torch.tensor([x.real.item()**n for x in e_vals])
+    e_vecs = e_vecs.real
+    # e_vecs already represents S in A = S*D*S^(-1) since columns are eigenvectors
+    return e_vecs @ torch.diag(e_vals) @ torch.linalg.inv(e_vecs)
+
+
+def matrix_log(A: torch.Tensor) -> torch.Tensor:
+    """No built-in function for finding the logarithm of a matrix."""
+    e_vals, e_vecs = torch.linalg.eig(A)
+    e_vals = torch.tensor([np.log(x.real.item()) for x in e_vals])
+    e_vecs = e_vecs.real
+    return e_vecs @ torch.diag(e_vals) @ torch.linalg.inv(e_vecs)
 
 
 def train_loop(data_loader: DataLoader, model: nn.Module, loss_fn, optimizer, device):
@@ -138,7 +179,7 @@ if __name__ == "__main__":
     data_loader = DataLoader(data_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     model = GigaMesher9000().to(device)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = matrix_loss
     optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
     
     for t in range(EPOCHS):
