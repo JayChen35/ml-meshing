@@ -5,7 +5,6 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
-from scipy.linalg import logm
 import pandas as pd
 import os, re
 from readgri import readgri
