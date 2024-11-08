@@ -25,7 +25,7 @@ class GigaMesher9000(nn.Module):
             nn.Linear(10, 10)
         )
         self.spatial_net = nn.Sequential(
-            nn.Linear(2, 10),
+            nn.Linear(3, 10),
             nn.ReLU(),
             nn.Linear(10, 10)
         )
@@ -38,12 +38,13 @@ class GigaMesher9000(nn.Module):
 
     def forward(self, x: np.ndarray):
         """
-        The feedforward step. x is a 1x5 numpy array, with the first two values being the
-        (x,y) position of a point, and the next three values representing (Re, Mach, AoA)
+        The feedforward step. x is a 1x6 numpy array, with the first two values being the
+        (x,y) position of the centroid of an element, then wall distance, and the next 
+        three values representing (Re, Mach, AoA)
         """
         # Since training in batches, take all rows (first arg) and slice by the column
-        s_logits = self.spatial_net(x[:, :2])
-        p_logits = self.param_net(x[:, 2:])
+        s_logits = self.spatial_net(x[:, :3])
+        p_logits = self.param_net(x[:, 3:])
         # Element-wise multipulcation
         to_feed = (s_logits/torch.norm(s_logits)) * (p_logits/torch.norm(p_logits))
         return self.output_net(to_feed)
@@ -68,11 +69,26 @@ class MeshDataset(Dataset):
             run_num = int(os.path.basename(file).split('.')[0][3:])
             mesh = readgri(file)
             vertices = mesh['V']; elements = mesh['E']
-            for element in elements:
+            # Preprocess wall distance information
+            dist_f_name = 'walldistance' + str(run_num) + '.txt'
+            wall_dists = []
+            with open(os.path.join('./walldist', dist_f_name), 'r') as dist_file:
+                line = dist_file.readline()
+                while line:
+                    if line[0] == '%': 
+                        pass
+                    elif len(line.split()) > 1:
+                        avg_d = np.mean([float(dist_file.readline()) for _ in range(3)])
+                        wall_dists.append(avg_d)
+                    line = dist_file.readline()
+            assert(len(wall_dists) == len(elements))
+
+            for i, element in enumerate(elements):
                 verts = [vertices[v_ind] for v_ind in element]  # (x,y) for each vertex
                 centroid = [np.mean([v[0] for v in verts]), np.mean([v[1] for v in verts])]
-                # Combine spatial and parameter information into a feature Tensor 
-                feature = centroid + [self.reynolds, self.mach, np.deg2rad(run_num-6)]
+                # Combine spatial and parameter information into a feature Tensor
+                params = [self.reynolds, self.mach, np.deg2rad(run_num-6)]
+                feature = centroid + [wall_dists[i]] + params
                 
                 # Find the correct A, B, and C terms in our metric field
                 delta_x = [verts[i] - verts[i-1] for i in range(len(verts))]
