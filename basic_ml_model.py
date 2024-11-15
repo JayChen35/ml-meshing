@@ -6,7 +6,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 import pandas as pd
-import os, re
+import os, re, time
 from readgri import readgri
 import argparse, psutil, ast
 
@@ -69,22 +69,23 @@ class MeshDataset(Dataset):
         # We want to import data, if possible
         if (not args.generate_data) and os.path.exists(args.data_path):
             self.data = pd.read_csv(args.data_path)
-            for i, row in self.data.iterrows():
-                feature, label = ast.literal_eval(row['feature']), ast.literal_eval(row['label'])
-                # Using at() here to set an entire list to a DataFrame cell
-                self.data.at[i, 'feature'] = feature
-                self.data.at[i, 'label'] = label
             print(f'Training data imported from {args.data_path}')
         else:
             print('Generating training data...')
+            start_time = time.perf_counter()
             self.data = self.load_data()
+            print(f'Data generated in {time.perf_counter()-start_time:.2f} seconds')
         print(self.data.head())
         if args.export_data:
             print(f'Exporting compiled training data to {args.data_path}')
             self.data.to_csv(args.data_path, index=False)
 
     def load_data(self) -> pd.DataFrame:
+        """
+        Generate training data from the meshes. The keys are specified in order below.
+        """
         data = []
+        data_keys = ['x', 'y', 'wall_dist', 'Re', 'Mach', 'AoA', 'a', 'b', 'c']
         for file in self.files:
             run_num = int(os.path.basename(file).split('.')[0][3:])
             mesh = readgri(file)
@@ -106,18 +107,19 @@ class MeshDataset(Dataset):
             for i, element in enumerate(elements):
                 verts = [vertices[v_ind] for v_ind in element]  # (x,y) for each vertex
                 centroid = [np.mean([v[0] for v in verts]), np.mean([v[1] for v in verts])]
-                # Combine spatial and parameter information into a feature Tensor
+                # Combine spatial and parameter information into a feature
                 params = [self.reynolds, self.mach, np.deg2rad(run_num-6)]
                 feature = centroid + [wall_dists[i]] + params
-                
                 # Find the correct A, B, and C terms in our metric field
                 delta_x = [verts[i] - verts[i-1] for i in range(len(verts))]
                 # All delta x are a unit length L=1 apart, solve for M
                 A_mat = [[vec[0]**2, 2*vec[0]*vec[1], vec[1]**2] for vec in delta_x]
                 A_mat = np.reshape(np.asarray(A_mat), (3,3))
                 metric_abc = np.matmul(np.linalg.inv(A_mat), np.ones((3,1))).flatten()
-                data.append(([float(x) for x in feature], [float(y) for y in metric_abc]))
-        return pd.DataFrame(data, columns=['feature', 'label'])
+                label = list(metric_abc)
+                # Append to data structure
+                data.append(feature + label)
+        return pd.DataFrame(data, columns=data_keys)
 
     def __len__(self):
         return len(self.data)
@@ -126,7 +128,8 @@ class MeshDataset(Dataset):
         """
         Returns a tuple in the form of (feature, label) from internal data
         """
-        sample = tuple(self.data.iloc[idx])
+        row = tuple(self.data.iloc[idx])
+        sample = (row[:6], row[6:])
         if self.transform:
             sample = self.transform(sample)
         return sample
