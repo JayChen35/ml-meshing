@@ -8,12 +8,18 @@ import numpy as np
 import pandas as pd
 import os, re
 from readgri import readgri
+import argparse, psutil, ast
 
 # Hyperparameters
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 32
 EPOCHS = 5
 TRAIN_FRACTION = 0.8
+# NOTE: The following line checking for power only works on Linux systems
+DEVICE = ("cuda"
+    if torch.cuda.is_available() and psutil.sensors_battery().power_plugged
+    else "cpu"
+)
 
 
 class GigaMesher9000(nn.Module):
@@ -35,7 +41,6 @@ class GigaMesher9000(nn.Module):
             nn.Linear(100, 3)
         )
 
-
     def forward(self, x: np.ndarray):
         """
         The feedforward step. x is a 1x6 numpy array, with the first two values being the
@@ -51,7 +56,7 @@ class GigaMesher9000(nn.Module):
 
 
 class MeshDataset(Dataset):
-    def __init__(self, path: str, file_regex: str, transform=None):
+    def __init__(self, path: str, file_regex: str, args, transform=None):
         """
         Args:
             transform (callable, optional): Optional transform to be applied on a sample
@@ -61,7 +66,22 @@ class MeshDataset(Dataset):
         regex = re.compile(file_regex)
         self.files = [os.path.join(path, f) for f in os.listdir(path) if regex.match(f)]
         self.transform = transform
-        self.data = self.load_data()
+        # We want to import data, if possible
+        if (not args.generate_data) and os.path.exists(args.data_path):
+            self.data = pd.read_csv(args.data_path)
+            for i, row in self.data.iterrows():
+                feature, label = ast.literal_eval(row['feature']), ast.literal_eval(row['label'])
+                # Using at() here to set an entire list to a DataFrame cell
+                self.data.at[i, 'feature'] = feature
+                self.data.at[i, 'label'] = label
+            print(f'Training data imported from {args.data_path}')
+        else:
+            print('Generating training data...')
+            self.data = self.load_data()
+        print(self.data.head())
+        if args.export_data:
+            print(f'Exporting compiled training data to {args.data_path}')
+            self.data.to_csv(args.data_path, index=False)
 
     def load_data(self) -> pd.DataFrame:
         data = []
@@ -96,7 +116,7 @@ class MeshDataset(Dataset):
                 A_mat = [[vec[0]**2, 2*vec[0]*vec[1], vec[1]**2] for vec in delta_x]
                 A_mat = np.reshape(np.asarray(A_mat), (3,3))
                 metric_abc = np.matmul(np.linalg.inv(A_mat), np.ones((3,1))).flatten()
-                data.append((np.asarray(feature), metric_abc))
+                data.append(([float(x) for x in feature], [float(y) for y in metric_abc]))
         return pd.DataFrame(data, columns=['feature', 'label'])
 
     def __len__(self):
@@ -163,11 +183,11 @@ def matrix_operator(A: torch.Tensor, operator) -> torch.Tensor:
     return e_vecs @ torch.diag(e_vals) @ torch.linalg.inv(e_vecs)
 
 
-def train_loop(data_loader: DataLoader, model: nn.Module, loss_fn, optimizer, device):
+def train_loop(data_loader: DataLoader, model: nn.Module, loss_fn, optimizer):
     # Set the model to training mode
     model.train()
     for batch_i, (features, labels) in enumerate(data_loader):
-        features, labels = features.to(device), labels.to(device)
+        features, labels = features.to(DEVICE), labels.to(DEVICE)
         # Labels is of shape [BATCH_SIZE, 3] since (A,B,C) of metric field
         pred = model(features)  # Passing an entire batch size into the model
         loss = loss_fn(pred, labels)
@@ -182,7 +202,7 @@ def train_loop(data_loader: DataLoader, model: nn.Module, loss_fn, optimizer, de
             print(f"Loss: {loss.item():>7f}  [{current:>5d}/{total_data:>5d}]")
 
 
-def test_loop(data_loader: DataLoader, model: nn.Module, loss_fn, device):
+def test_loop(data_loader: DataLoader, model: nn.Module, loss_fn):
     # Set the model to evaluation mode
     model.eval()
     num_batches = len(data_loader)
@@ -191,7 +211,7 @@ def test_loop(data_loader: DataLoader, model: nn.Module, loss_fn, device):
     # Also reduces unnecessary computations for tensors with requires_grad=True
     with torch.no_grad():
         for feature, label in data_loader:
-            feature, label = feature.to(device), label.to(device)
+            feature, label = feature.to(DEVICE), label.to(DEVICE)
             pred = model(feature)
             test_loss += loss_fn(pred, label).item()
 
@@ -200,33 +220,36 @@ def test_loop(data_loader: DataLoader, model: nn.Module, loss_fn, device):
 
 
 if __name__ == "__main__":
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    if DEVICE == 'cuda': print(f"CUDA device: {torch.cuda.get_device_name(DEVICE)}")
+    print(f"Device in use: {DEVICE}")
     torch.set_default_dtype(torch.float64)
     torch.set_grad_enabled(True)
+    # Ingest command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-e', '--export_data', help='Export training data, if generated', action='store_true')
+    parser.add_argument('-g', '--generate_data', help='Generate training data instead of importing', action='store_true')
+    parser.add_argument('-d', '--data_path', help='Path for training data', default='./data/training_data.csv')
+    parser.add_argument('-p', '--plot', help='Plot for debugging', action='store_true', default=False)
+    # NOTE: There is a difference between store_false and default=False
+    args = parser.parse_args()
+
     # Format data from .gri files to feed into training and testing
     folder_path = "./meshes/"
     gri_regex = "run.*gri"
-    print("Initializing data set...")
-    dataset = MeshDataset(folder_path, gri_regex, transform=ToTensor())
+    dataset = MeshDataset(folder_path, gri_regex, args, transform=ToTensor())
     train_size = int(TRAIN_FRACTION * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = GigaMesher9000().to(device)
+    model = GigaMesher9000().to(DEVICE)
     loss_fn = MetricLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
     
     for t in range(EPOCHS):
         print(f"----------------Epoch {t+1}---------------")
-        train_loop(train_loader, model, loss_fn, optimizer, device)
-        test_loop(test_loader, model, loss_fn, device)
+        train_loop(train_loader, model, loss_fn, optimizer)
+        test_loop(test_loader, model, loss_fn)
     print("Done!")
     
