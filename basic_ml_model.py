@@ -6,9 +6,11 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import os, re, time
 from readgri import readgri
-import argparse, psutil, ast
+import argparse, psutil
 
 # Hyperparameters
 LEARNING_RATE = 1e-3
@@ -20,6 +22,7 @@ DEVICE = ("cuda"
     if torch.cuda.is_available() and psutil.sensors_battery().power_plugged
     else "cpu"
 )
+DATA_KEYS = ['x', 'y', 'wall_dist', 'Re', 'Mach', 'AoA', 'a', 'b', 'c']
 
 
 class GigaMesher9000(nn.Module):
@@ -61,33 +64,42 @@ class MeshDataset(Dataset):
         Args:
             transform (callable, optional): Optional transform to be applied on a sample
         """
+        super(MeshDataset, self).__init__()
         self.reynolds = 1e6
         self.mach = 0.25
         regex = re.compile(file_regex)
         self.files = [os.path.join(path, f) for f in os.listdir(path) if regex.match(f)]
+        self.files = sorted(self.files, key=lambda x: int(os.path.basename(x).split('.')[0][3:]))
         self.transform = transform
+        self.data_split_indices = dict()
+
         # We want to import data, if possible
-        if (not args.generate_data) and os.path.exists(args.data_path):
+        base_name = os.path.basename(args.data_path).split('.')[0]
+        info_path = args.data_path.replace(base_name, base_name + '_info')
+        if (not args.generate_data) and os.path.exists(args.data_path) and os.path.exists(info_path):
             self.data = pd.read_csv(args.data_path)
+            temp_df = pd.read_csv(info_path, index_col=0)
+            self.data_split_indices = {i: tuple(row) for i, row in temp_df.iterrows()}
             print(f'Training data imported from {args.data_path}')
         else:
             print('Generating training data...')
             start_time = time.perf_counter()
-            self.data = self.load_data()
+            self.data = self.create_data()
             print(f'Data generated in {time.perf_counter()-start_time:.2f} seconds')
         print(self.data.head())
         if args.export_data:
             print(f'Exporting compiled training data to {args.data_path}')
             self.data.to_csv(args.data_path, index=False)
+            pd.DataFrame.from_dict(self.data_split_indices, orient='index').to_csv(info_path)
 
-    def load_data(self) -> pd.DataFrame:
+    def create_data(self) -> pd.DataFrame:
         """
-        Generate training data from the meshes. The keys are specified in order below.
+        Generate training data from the meshes. Also creates an index for the data structure.
         """
         data = []
-        data_keys = ['x', 'y', 'wall_dist', 'Re', 'Mach', 'AoA', 'a', 'b', 'c']
         for file in self.files:
-            run_num = int(os.path.basename(file).split('.')[0][3:])
+            run_str = os.path.basename(file).split('.')[0]
+            run_num = int(run_str[3:])
             mesh = readgri(file)
             vertices = mesh['V']; elements = mesh['E']
             # Preprocess wall distance information
@@ -119,7 +131,13 @@ class MeshDataset(Dataset):
                 label = list(metric_abc)
                 # Append to data structure
                 data.append(feature + label)
-        return pd.DataFrame(data, columns=data_keys)
+
+            # Add the split points if we would like to verify training data
+            start_i = 0
+            if f'run{run_num-1}' in self.data_split_indices.keys():
+                start_i =  self.data_split_indices[f'run{run_num-1}'][-1]
+            self.data_split_indices.update({run_str: (start_i, start_i + len(elements))})
+        return pd.DataFrame(data, columns=DATA_KEYS)
 
     def __len__(self):
         return len(self.data)
@@ -168,6 +186,82 @@ class MetricLoss(nn.Module):
             # Take Frobenius norm of S, ignoring the square root at the end
             total_loss += torch.sum(torch.square(S))
         return total_loss / len(prediction)
+
+
+def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
+    """
+    Plot the ellipses corresponding to the prediction of the model, and the training
+    data label (truth) for a given loss. This is to verify the data and loss function
+    are performing as expected. 
+    """
+    # Recall that the output of the network is S, for which we need to take the matrix
+    # exponent of to get the actual metric field prediction containing (A, B, C)
+    plt.style.use('fast')
+    mesh = readgri(mesh_file)
+
+    # Plot the bare mesh
+    V = mesh['V']; E = mesh['E']; BE = mesh['BE']
+    fig, ax = plt.subplots()
+    plt.triplot(V[:,0], V[:,1], E, 'k-')
+    for i in range(BE.shape[0]):
+        plt.plot(V[BE[i,0:2],0], V[BE[i,0:2],1], '-', linewidth=1, color='black')
+
+    # Generate loss from this entire GRI file
+    base_name = os.path.basename(mesh_file).split('.')[0]
+    start, end = data_set.dataset.data_split_indices[base_name]
+    data_rows = data_set.dataset.data.iloc[start: end]
+    features = torch.from_numpy(data_rows.iloc[:, :6].to_numpy()).to(DEVICE)
+    labels = torch.from_numpy(data_rows.iloc[:, 6:].to_numpy()).to(DEVICE)
+    predictions, loss = None, None
+    model.eval()
+    with torch.no_grad():
+        predictions = model(features)
+        loss = loss_fn(predictions, labels)
+
+    # Plot the ellipses
+    for i, element in enumerate(E):
+        if i % 10 != 0: continue
+        verts = [V[v_ind] for v_ind in element]
+        raw_centroid = [np.mean([v[0] for v in verts]), np.mean([v[1] for v in verts])]
+        row = data_rows.iloc[i]
+        saved_centroid = [row['x'], row['y']]
+        # Check that the centroid from training data is the same as seen in the file
+        assert(np.all(np.isclose(raw_centroid, saved_centroid)))
+
+        # Get and plot the correct ellipse data
+        soln_M_mat = torch.tensor([[row['a'], row['b']], [row['b'], row['c']]])
+        plot_loss_helper(saved_centroid, soln_M_mat, ax, 'blue')
+
+        # Get and plot the prediction ellipse
+        pred_row = predictions[i]
+        S_0 = torch.tensor([[pred_row[0], pred_row[1]], [pred_row[1], pred_row[2]]])
+        pred_M_mat = matrix_operator(S_0, "exp")
+        plot_loss_helper(saved_centroid, pred_M_mat, ax, 'red')
+
+    plt.axis('equal')
+    plt.title(f'Prediction error = {loss:.2f} for {base_name}')
+    plt.tick_params(axis='both', labelsize=12)
+    fig.tight_layout()
+    # Create dummy legend handles for the ellipses
+    red_patch = Ellipse((0, 0), 1, 1, color='red', label='Prediction')
+    blue_patch = Ellipse((0, 0), 1, 1, color='blue', label='Actual')
+    # Add these handles to the legend
+    handles = [red_patch, blue_patch]
+    labels = [handle.get_label() for handle in handles]
+    ax.legend(handles=handles, labels=labels, loc='upper right')
+    plt.show()
+    plt.close(fig)
+
+
+def plot_loss_helper(centroid, M_mat: torch.Tensor, ax, color: str):
+    eig_vals, eig_vecs = torch.linalg.eigh(M_mat)
+    axes_scales = {'major': max(eig_vals)**(-1/2), 'minor': min(eig_vals)**(-1/2)}
+    major_ax_i = torch.argmax(eig_vals)
+    angle_major = torch.arctan2(eig_vecs[major_ax_i][1], eig_vecs[major_ax_i][0])
+    plt.scatter(centroid[0], centroid[1], color='black', alpha=0.5, s=2)
+    ellipse = Ellipse(centroid, axes_scales['major'].item(), axes_scales['minor'].item(),
+                    angle=-torch.rad2deg(angle_major).item(), facecolor=color, alpha=0.5)
+    ax.add_patch(ellipse)
 
 
 def matrix_operator(A: torch.Tensor, operator) -> torch.Tensor:
@@ -239,6 +333,7 @@ if __name__ == "__main__":
     # Format data from .gri files to feed into training and testing
     folder_path = "./meshes/"
     gri_regex = "run.*gri"
+    debug_mesh = "run1.gri"
     dataset = MeshDataset(folder_path, gri_regex, args, transform=ToTensor())
     train_size = int(TRAIN_FRACTION * len(dataset))
     test_size = len(dataset) - train_size
@@ -252,6 +347,8 @@ if __name__ == "__main__":
     
     for t in range(EPOCHS):
         print(f"----------------Epoch {t+1}---------------")
+        if args.plot:
+            plot_loss(os.path.join(folder_path, debug_mesh), train_dataset, model, loss_fn)
         train_loop(train_loader, model, loss_fn, optimizer)
         test_loop(test_loader, model, loss_fn)
     print("Done!")
