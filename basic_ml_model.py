@@ -44,7 +44,7 @@ class GigaMesher9000(nn.Module):
             nn.Linear(100, 3)
         )
 
-    def forward(self, x: np.ndarray):
+    def forward(self, x: torch.Tensor):
         """
         The feedforward step. x is a 1x6 numpy array, with the first two values being the
         (x,y) position of the centroid of an element, then wall distance, and the next 
@@ -65,7 +65,7 @@ class MeshDataset(Dataset):
             transform (callable, optional): Optional transform to be applied on a sample
         """
         super(MeshDataset, self).__init__()
-        self.reynolds = 1e6
+        self.reynolds = float(np.log(1e6))
         self.mach = 0.25
         regex = re.compile(file_regex)
         self.files = [os.path.join(path, f) for f in os.listdir(path) if regex.match(f)]
@@ -77,10 +77,12 @@ class MeshDataset(Dataset):
         base_name = os.path.basename(args.data_path).split('.')[0]
         info_path = args.data_path.replace(base_name, base_name + '_info')
         if (not args.generate_data) and os.path.exists(args.data_path) and os.path.exists(info_path):
+            start_time = time.perf_counter()
             self.data = pd.read_csv(args.data_path)
             temp_df = pd.read_csv(info_path, index_col=0)
             self.data_split_indices = {i: tuple(row) for i, row in temp_df.iterrows()}
-            print(f'Training data imported from {args.data_path}')
+            time_elapsed = time.perf_counter()-start_time
+            print(f'Training data imported from {args.data_path} in {time_elapsed:.2f} seconds')
         else:
             print('Generating training data...')
             start_time = time.perf_counter()
@@ -105,7 +107,7 @@ class MeshDataset(Dataset):
             # Preprocess wall distance information
             dist_f_name = 'walldistance' + str(run_num) + '.txt'
             wall_dists = []
-            with open(os.path.join('./walldist', dist_f_name), 'r') as dist_file:
+            with open(os.path.join('./fine_walldist', dist_f_name), 'r') as dist_file:
                 line = dist_file.readline()
                 while line:
                     if line[0] == '%': 
@@ -198,7 +200,6 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
     # exponent of to get the actual metric field prediction containing (A, B, C)
     plt.style.use('fast')
     mesh = readgri(mesh_file)
-
     # Plot the bare mesh
     V = mesh['V']; E = mesh['E']; BE = mesh['BE']
     fig, ax = plt.subplots()
@@ -220,7 +221,7 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
 
     # Plot the ellipses
     for i, element in enumerate(E):
-        if i % 10 != 0: continue
+        if i % 50 != 0: continue
         verts = [V[v_ind] for v_ind in element]
         raw_centroid = [np.mean([v[0] for v in verts]), np.mean([v[1] for v in verts])]
         row = data_rows.iloc[i]
@@ -254,13 +255,17 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
 
 
 def plot_loss_helper(centroid, M_mat: torch.Tensor, ax, color: str):
-    eig_vals, eig_vecs = torch.linalg.eigh(M_mat)
-    axes_scales = {'major': max(eig_vals)**(-1/2), 'minor': min(eig_vals)**(-1/2)}
-    major_ax_i = torch.argmax(eig_vals)
-    angle_major = torch.arctan2(eig_vecs[major_ax_i][1], eig_vecs[major_ax_i][0])
-    plt.scatter(centroid[0], centroid[1], color='black', alpha=0.5, s=2)
-    ellipse = Ellipse(centroid, axes_scales['major'].item(), axes_scales['minor'].item(),
-                    angle=-torch.rad2deg(angle_major).item(), facecolor=color, alpha=0.5)
+    eig_vals, eig_vecs = np.linalg.eig(M_mat.cpu())
+    eig_vecs = np.asarray(eig_vecs)
+    major_ax_i = np.argmax(eig_vals)
+    minor_ax_i = int(not major_ax_i)
+    axes_scales = np.zeros(len(eig_vals))
+    axes_scales[major_ax_i] = eig_vals[major_ax_i]**(-1/2)
+    axes_scales[minor_ax_i] = eig_vals[minor_ax_i]**(-1/2)
+    angle_major = np.arctan2(eig_vecs[major_ax_i][1], eig_vecs[major_ax_i][0])
+    plt.scatter(centroid[0], centroid[1], color='red', alpha=0.5, s=2)
+    ellipse = Ellipse(centroid, axes_scales[major_ax_i], axes_scales[minor_ax_i],
+                        angle=-angle_major*180/np.pi, facecolor=color, alpha=0.5)
     ax.add_patch(ellipse)
 
 
@@ -331,7 +336,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Format data from .gri files to feed into training and testing
-    folder_path = "./meshes/"
+    folder_path = "./fine_meshes/"
     gri_regex = "run.*gri"
     debug_mesh = "run1.gri"
     dataset = MeshDataset(folder_path, gri_regex, args, transform=ToTensor())
@@ -352,4 +357,3 @@ if __name__ == "__main__":
         train_loop(train_loader, model, loss_fn, optimizer)
         test_loop(test_loader, model, loss_fn)
     print("Done!")
-    
