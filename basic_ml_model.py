@@ -4,6 +4,7 @@
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -14,8 +15,9 @@ import argparse, psutil
 
 # Hyperparameters
 LEARNING_RATE = 1e-3
-BATCH_SIZE = 32
-EPOCHS = 5
+BATCH_SIZE = 64
+EPOCHS = 20
+MOMENTUM = 0.9  # Allows optimizer to overcome local minima
 TRAIN_FRACTION = 0.8
 # NOTE: The following line checking for power only works on Linux systems
 DEVICE = ("cuda"
@@ -26,22 +28,36 @@ DATA_KEYS = ['x', 'y', 'wall_dist', 'Re', 'Mach', 'AoA', 'a', 'b', 'c']
 
 
 class GigaMesher9000(nn.Module):
-    def __init__(self):
+    def __init__(self, act_fn: nn.Module = nn.ReLU()):
         super().__init__()
         self.param_net = nn.Sequential(
-            nn.Linear(3, 10),
-            nn.ReLU(),
-            nn.Linear(10, 10)
+            nn.Linear(3, 32),
+            act_fn,
+            nn.Linear(32, 32),
+            act_fn,
+            nn.Linear(32, 10)
         )
         self.spatial_net = nn.Sequential(
-            nn.Linear(3, 10),
-            nn.ReLU(),
-            nn.Linear(10, 10)
+            nn.Linear(3, 64),
+            act_fn,
+            nn.Linear(64, 128),
+            act_fn,
+            nn.Linear(128, 64),
+            act_fn,
+            nn.Linear(64, 10)
         )
         self.output_net = nn.Sequential(
-            nn.Linear(10, 100),
-            nn.ReLU(),
-            nn.Linear(100, 3)
+            nn.Linear(10, 128),
+            act_fn,
+            nn.Linear(128, 512),
+            act_fn,
+            nn.Linear(512, 512),
+            act_fn,
+            nn.Linear(512, 256),
+            act_fn,
+            nn.Linear(256, 64),
+            act_fn,
+            nn.Linear(64, 3)
         )
 
     def forward(self, x: torch.Tensor):
@@ -175,19 +191,35 @@ class MetricLoss(nn.Module):
         super().__init__()
     
     def forward(self, prediction: torch.Tensor, actual: torch.Tensor):
-        # Not sure if there's a faster way to train a batch besides a for-loop
-        total_loss = 0
-        for row in range(len(prediction)):
-            pred, act = prediction[row], actual[row]
-            # Using torch.stack() here to preserve the computation graph for backpropagation
-            S_0 = torch.stack([torch.stack([pred[0], pred[1]]), torch.stack([pred[1], pred[2]])])
-            M_0 = matrix_operator(S_0, "exp")
-            M = torch.stack([torch.stack([act[0], act[1]]), torch.stack([act[1], act[2]])])
-            M_0_temp = torch.linalg.inv(matrix_operator(M_0, 1/2))
-            S = matrix_operator(M_0_temp @ M @ M_0_temp, "log")
-            # Take Frobenius norm of S, ignoring the square root at the end
-            total_loss += torch.sum(torch.square(S))
-        return total_loss / len(prediction)
+        """
+        A torch-optimized feedforward call. At the end, since the actual
+        matrices are 2x2, we want to create a 3D tensor of BATCH_SIZE of
+        2x2 matrices. So, we first stack the first row of the 2x2, which
+        is [a, b], into a Tensor of shape (BATCH_SIZE, 2). The same is
+        done with [c, d], which also creates a (BATCH_SIZE, 2) Tensor.
+        Then, we want to call torch.stack() with dim = -2, signifying we
+        want to insert/combine columns at the -2 index position, creating
+        an S_0 tensor of size (BATCH_SIZE, 2, 2).
+        """
+        # Reshape predictions and actuals to create batch matrices
+        S_0 = torch.stack([
+            torch.stack([prediction[:, 0], prediction[:, 1]], dim=-1),
+            torch.stack([prediction[:, 1], prediction[:, 2]], dim=-1)
+        ], dim=-2)  # Shape: (batch_size, 2, 2)
+        M = torch.stack([
+            torch.stack([actual[:, 0], actual[:, 1]], dim=-1),
+            torch.stack([actual[:, 1], actual[:, 2]], dim=-1)
+        ], dim=-2)  # Shape: (batch_size, 2, 2)
+
+        M_0 = matrix_operator(S_0, "exp")
+        M_0_temp = torch.linalg.inv(matrix_operator(M_0, 1/2))
+        # Compute S matrix, which measures distances between metrics
+        transformed_M = M_0_temp @ M @ M_0_temp
+        S = matrix_operator(transformed_M, "log")
+        # Compute Frobenius norm of S for each batch element
+        frobenius_norm_squared = torch.sum(S**2, dim=(-2, -1))
+        # First sum along -2 (columns), then by rows (-1)
+        return torch.mean(frobenius_norm_squared)
 
 
 def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
@@ -282,7 +314,7 @@ def matrix_operator(A: torch.Tensor, operator) -> torch.Tensor:
         assert type(operator) == float or type(operator) == int
         e_vals = torch.pow(e_vals, operator)
     # e_vecs already represents S in A = S*D*S^(-1) since columns are eigenvectors
-    return e_vecs @ torch.diag(e_vals) @ torch.linalg.inv(e_vecs)
+    return e_vecs @ torch.diag_embed(e_vals) @ torch.linalg.inv(e_vecs)
 
 
 def train_loop(data_loader: DataLoader, model: nn.Module, loss_fn, optimizer):
@@ -318,7 +350,7 @@ def test_loop(data_loader: DataLoader, model: nn.Module, loss_fn):
             test_loss += loss_fn(pred, label).item()
 
     test_loss /= num_batches
-    print(f"Testing average loss: {test_loss:>8f} \n")
+    return test_loss
 
 
 if __name__ == "__main__":
@@ -343,17 +375,30 @@ if __name__ == "__main__":
     train_size = int(TRAIN_FRACTION * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     model = GigaMesher9000().to(DEVICE)
     loss_fn = MetricLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',        # Minimize validation loss
+        factor=0.2,        # Multiply LR by 0.2 when triggered
+        patience=2,        # Wait 2 epochs of no improvement before reducing LR
+        threshold=5.0,     # Minimum change to qualify as an improvement
+        cooldown=0,        # Wait 0 epochs after reducing LR before monitoring again
+        min_lr=1e-6        # Do not reduce below this learning rate
+    )
     
-    for t in range(EPOCHS):
-        print(f"----------------Epoch {t+1}---------------")
-        if args.plot:
-            plot_loss(os.path.join(folder_path, debug_mesh), train_dataset, model, loss_fn)
+    for epoch in range(EPOCHS):
+        print(f"----------------Epoch {epoch+1} of {EPOCHS}----------------")
         train_loop(train_loader, model, loss_fn, optimizer)
-        test_loop(test_loader, model, loss_fn)
-    print("Done!")
+        val_loss = test_loop(test_loader, model, loss_fn)
+        scheduler.step(val_loss)
+        # Print diagnostic information
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}: val_loss={val_loss:.3f}, learning_rate={current_lr:.6f}")
+        if args.plot and epoch == EPOCHS-1:
+            plot_loss(os.path.join(folder_path, debug_mesh), train_dataset, model, loss_fn)
+    print('Program complete!')

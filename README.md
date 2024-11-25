@@ -25,7 +25,7 @@ To copy a directory recursively over SSH, use `rsync` (`scp` is less flexible)
 - `source/`: The trailing slash after the directory name is important. It indicates that the contents of the directory source_directory should be copied.
 - `--exclude='.*'`: This excludes all files and folders that start with a dot (`.`).
 For example, my local command is:
-`rsync -avz -e ssh --exclude='.*' ../ml-meshing jasonyc@pmultigrid.engin.umich.edu:~`
+`rsync -avz -e ssh --exclude='.*' --exclude='__*' ../ml-meshing jasonyc@pmultigrid.engin.umich.edu:~`
 
 To generate dependencies in a `requirements.txt`:
 `pip3 install pipreqs`
