@@ -15,7 +15,7 @@ import argparse, psutil
 
 # Hyperparameters
 LEARNING_RATE = 1e-3
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 EPOCHS = 20
 MOMENTUM = 0.9  # Allows optimizer to overcome local minima
 TRAIN_FRACTION = 0.8
@@ -211,6 +211,7 @@ class MetricLoss(nn.Module):
             torch.stack([actual[:, 1], actual[:, 2]], dim=-1)
         ], dim=-2)  # Shape: (batch_size, 2, 2)
 
+        # Raw matrix output is the matrix log of the metric, so exponentiate
         M_0 = matrix_operator(S_0, "exp")
         M_0_temp = torch.linalg.inv(matrix_operator(M_0, 1/2))
         # Compute S matrix, which measures distances between metrics
@@ -226,13 +227,12 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
     """
     Plot the ellipses corresponding to the prediction of the model, and the training
     data label (truth) for a given loss. This is to verify the data and loss function
-    are performing as expected. 
+    are performing as expected. Recall that the output of the network is S, for which
+    we need to take the matrix exponent of to get the actual metric field prediction 
+    containing the elements (A, B, C).
     """
-    # Recall that the output of the network is S, for which we need to take the matrix
-    # exponent of to get the actual metric field prediction containing (A, B, C)
-    plt.style.use('fast')
-    mesh = readgri(mesh_file)
     # Plot the bare mesh
+    mesh = readgri(mesh_file)
     V = mesh['V']; E = mesh['E']; BE = mesh['BE']
     fig, ax = plt.subplots()
     plt.triplot(V[:,0], V[:,1], E, 'k-')
@@ -242,12 +242,14 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
     # Generate loss from this entire GRI file
     base_name = os.path.basename(mesh_file).split('.')[0]
     start, end = data_set.dataset.data_split_indices[base_name]
+    # Find the data for this particular GRI file within our combined dataset
     data_rows = data_set.dataset.data.iloc[start: end]
     features = torch.from_numpy(data_rows.iloc[:, :6].to_numpy()).to(DEVICE)
     labels = torch.from_numpy(data_rows.iloc[:, 6:].to_numpy()).to(DEVICE)
     predictions, loss = None, None
     model.eval()
     with torch.no_grad():
+        # Run the model in evaluation mode on all features, and record the loss
         predictions = model(features)
         loss = loss_fn(predictions, labels)
 
@@ -260,11 +262,9 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
         saved_centroid = [row['x'], row['y']]
         # Check that the centroid from training data is the same as seen in the file
         assert(np.all(np.isclose(raw_centroid, saved_centroid)))
-
         # Get and plot the correct ellipse data
         soln_M_mat = torch.tensor([[row['a'], row['b']], [row['b'], row['c']]])
         plot_loss_helper(saved_centroid, soln_M_mat, ax, 'blue')
-
         # Get and plot the prediction ellipse
         pred_row = predictions[i]
         S_0 = torch.tensor([[pred_row[0], pred_row[1]], [pred_row[1], pred_row[2]]])
@@ -283,6 +283,65 @@ def plot_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
     labels = [handle.get_label() for handle in handles]
     ax.legend(handles=handles, labels=labels, loc='upper right')
     plt.show()
+    plt.close(fig)
+
+
+def plot_individual_loss(mesh_file: str, data_set: MeshDataset, model: nn.Module, loss_fn):
+    """
+    Plot losses of individual elements, one at a time.
+    """
+    WINDOW = (-0.2, 0.2, -0.3, -0.1)
+    mesh = readgri(mesh_file)
+    V = mesh['V']; E = mesh['E']; BE = mesh['BE']
+    fig, ax = plt.subplots()
+    plt.triplot(V[:,0], V[:,1], E, 'k-')
+    for i in range(BE.shape[0]):
+        plt.plot(V[BE[i,0:2],0], V[BE[i,0:2],1], '-', linewidth=1, color='black')
+
+    base_name = os.path.basename(mesh_file).split('.')[0]
+    start, end = data_set.dataset.data_split_indices[base_name]
+    data_rows = data_set.dataset.data.iloc[start: end]
+
+    plt.style.use('fast')
+    plt.ion()
+    plt.axis(WINDOW)
+    fig = plt.gcf()
+    fig.set_size_inches(16, 9, forward=True)
+    for i in range(len(E)):
+        row = data_rows.iloc[i]
+        saved_centroid = [row['x'], row['y']]
+        x_min, x_max, y_min, y_max = WINDOW
+        if not((x_min < row['x'] < x_max) and (y_min < row['y'] < y_max)):
+            continue
+        # Get and plot the correct ellipse data
+        soln_M_mat = torch.tensor([[row['a'], row['b']], [row['b'], row['c']]])
+        # Make the prediction
+        model.eval()
+        curr_pred = None
+        curr_label = torch.from_numpy(row[6:].to_numpy().reshape(1,3)).to(DEVICE)
+        with torch.no_grad():
+            curr_element_feat = torch.from_numpy(row[:6].to_numpy().reshape(1,6)).to(DEVICE)
+            curr_pred = model(curr_element_feat)
+        S_0 = torch.tensor([[curr_pred[0,0], curr_pred[0,1]], [curr_pred[0,1], curr_pred[0,2]]])
+        pred_M_mat = matrix_operator(S_0, "exp")
+        loss = loss_fn(curr_pred, curr_label)
+        # Also, plot a general average ellipse to sanity check
+        control_mat = torch.tensor([[223.0, 4.0], [4.0, 450.0]])
+        control_log = matrix_operator(control_mat, 'log').flatten()
+        control_raw_output = torch.tensor([[control_log[0], control_log[1], control_log[-1]]])
+        control_loss = loss_fn(control_raw_output.to(DEVICE), curr_label)
+
+        plot_loss_helper(saved_centroid, soln_M_mat, ax, 'blue')
+        plot_loss_helper(saved_centroid, control_mat, ax, 'green')
+        plot_loss_helper(saved_centroid, pred_M_mat, ax, 'red')
+        plt.show()
+        plt.pause(0.1)
+        print('------------------------------------')
+        print(f'Centroid at ({row['x']:.3f}, {row['y']:.3f}) and wall distance of {row['wall_dist']:.3f}')
+        print(f'True metric: {soln_M_mat}')
+        print(f'Predicted metric: {pred_M_mat}')
+        print(f'Loss for this element: {loss:.2f}')
+        print(f'Reference (control) loss: {control_loss:.2f}')
     plt.close(fig)
 
 
@@ -364,6 +423,7 @@ if __name__ == "__main__":
     parser.add_argument('-g', '--generate_data', help='Generate training data instead of importing', action='store_true')
     parser.add_argument('-d', '--data_path', help='Path for training data', default='./data/training_data.csv')
     parser.add_argument('-p', '--plot', help='Plot for debugging', action='store_true', default=False)
+    parser.add_argument('-i', '--interactive', help='Interactively debug', action='store_true', default=False)
     # NOTE: There is a difference between store_false and default=False
     args = parser.parse_args()
 
@@ -399,6 +459,8 @@ if __name__ == "__main__":
         # Print diagnostic information
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}: val_loss={val_loss:.3f}, learning_rate={current_lr:.6f}")
-        if args.plot and epoch == EPOCHS-1:
+        if args.interactive:
+            plot_individual_loss(os.path.join(folder_path, debug_mesh), train_dataset, model, loss_fn)
+        elif args.plot:
             plot_loss(os.path.join(folder_path, debug_mesh), train_dataset, model, loss_fn)
     print('Program complete!')
